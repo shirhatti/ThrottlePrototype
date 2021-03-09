@@ -33,24 +33,24 @@ namespace Throttling
         long EstimatedCount { get; }
 
         // Fast synchronous attempt to acquire resources, it won't actually acquire the resource
-        IResource2 TryAcquire(long requestedCount, bool minimumCount = false);
+        IResourceWrapper TryAcquire(long requestedCount, bool minimumCount = false);
 
         // Wait until the requested resources are available
-        ValueTask<IResource2> AcquireAsync(long requestedCount, bool minimumCount = false, CancellationToken cancellationToken = default);
+        ValueTask<IResourceWrapper> AcquireAsync(long requestedCount, bool minimumCount = false, CancellationToken cancellationToken = default);
     }
 
-    public interface IResource2 : IDisposable
+    public interface IResourceWrapper : IDisposable
     {
         long Count { get; }
     }
 
     public interface IResourceStore
     {
-        // Read the resource count for a given ID
-        ValueTask<long> GetResourceCountAsync(string id);
+        // Read the resource count for a given Key
+        ValueTask<long> GetResourceCountAsync(string key);
 
-        // Update the resource count for a given ID, negative to free up resources
-        ValueTask<long> UpdateResourceCountAsync(string id, long resourceRequested, bool allowBestEffort = false);
+        // Update the resource count for a given Key, negative to free up resources
+        ValueTask<long> UpdateResourceCountAsync(string key, long resourceRequested, bool allowBestEffort = false);
     }
 
     public interface IResourcePolicy
@@ -81,7 +81,7 @@ namespace Throttling
     public class ResourceManager : IResourceManager
     {
         private IEnumerable<IResourcePolicy> _policies;
-        private MemoryCache _resourceCache = new MemoryCache(new MemoryCacheOptions());
+        private MemoryCache _limiterCache = new MemoryCache(new MemoryCacheOptions());
 
         public ResourceManager(IEnumerable<IResourcePolicy> policies)
         {
@@ -98,7 +98,7 @@ namespace Throttling
                     continue;
                 }
 
-                yield return _resourceCache.GetOrCreate(key, e => policy.CreateLimiter(key));
+                yield return _limiterCache.GetOrCreate(key, e => policy.CreateLimiter(key));
             }
         }
     }
@@ -232,14 +232,14 @@ namespace Throttling
                 }
             }, this, TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(1));
         }
-        public ValueTask<IResource2> AcquireAsync(long requestedCount, bool minimumCount = false, CancellationToken cancellationToken = default)
+        public ValueTask<IResourceWrapper> AcquireAsync(long requestedCount, bool minimumCount = false, CancellationToken cancellationToken = default)
         {
             lock (_lock) // Check lock check
             {
                 if (EstimatedCount > requestedCount)
                 {
                     Interlocked.Add(ref _resourceCount, -requestedCount);
-                    return ValueTask.FromResult((IResource2)(new Resource2(requestedCount, this)));
+                    return ValueTask.FromResult((IResourceWrapper)(new Resource2(requestedCount, this)));
                 }
             }
 
@@ -252,9 +252,9 @@ namespace Throttling
                     {
                         var obtainedResource = Math.Min(requestedCount, available);
                         Interlocked.Add(ref _resourceCount, -obtainedResource);
-                        return ValueTask.FromResult((IResource2)(new Resource2(obtainedResource, this)));
+                        return ValueTask.FromResult((IResourceWrapper)(new Resource2(obtainedResource, this)));
                     }
-                    return ValueTask.FromResult((IResource2)(new Resource2(0, this)));
+                    return ValueTask.FromResult((IResourceWrapper)(new Resource2(0, this)));
                 }
             }
 
@@ -272,13 +272,13 @@ namespace Throttling
                     if (EstimatedCount > requestedCount)
                     {
                         Interlocked.Add(ref _resourceCount, -requestedCount);
-                        return ValueTask.FromResult((IResource2)(new Resource2(requestedCount, this)));
+                        return ValueTask.FromResult((IResourceWrapper)(new Resource2(requestedCount, this)));
                     }
                 }
             }
         }
 
-        public IResource2 TryAcquire(long requestedCount, bool minimumCount = false)
+        public IResourceWrapper TryAcquire(long requestedCount, bool minimumCount = false)
         {
             if (EstimatedCount > requestedCount)
             {
@@ -295,7 +295,7 @@ namespace Throttling
             return new Resource2(0, this);
         }
 
-        internal class Resource2 : IResource2
+        internal class Resource2 : IResourceWrapper
         {
             private long _count;
             private ResourceLimiter _limiter;
@@ -477,7 +477,6 @@ namespace Throttling
 
     public class Startup
     {
-
         private IResource _renewable = new RenewableResource(5, 2);
         private IResource _nonRenewable = new NonRenewableResource(5);
         private IResourceLimiter _resourceLimiter = new ResourceLimiter(5, 2);
@@ -486,9 +485,10 @@ namespace Throttling
         // For more information on how to configure your application, visit https://go.microsoft.com/fwlink/?LinkID=398940
         public void ConfigureServices(IServiceCollection services)
         {
-            services.AddSingleton<IResourceManager, ResourceManager>();
-            services.AddSingleton<IResourcePolicy, GETResourcePolicy>();
             services.AddSingleton<IResourceStore, RedisResourceStore>();
+            services.AddSingleton<IResourcePolicy, GETResourcePolicy>();
+            services.AddSingleton<IResourcePolicy, POSTResourcePolicy>();
+            services.AddSingleton<IResourceManager, ResourceManager>();
         }
 
         // This method gets called by the runtime. Use this method to configure the HTTP request pipeline.
@@ -506,15 +506,15 @@ namespace Throttling
                 endpoints.MapGet("/", async context =>
                 {
                     // Renewable
-                    if (await _renewable.WaitAsync(1, true) == 0)
+                    if (await _renewable.WaitAsync(1) == 0)
                     {
                         context.Response.StatusCode = StatusCodes.Status429TooManyRequests;
                         return;
                     }
-                    // await context.Response.WriteAsync("Hello World!");
+                    await context.Response.WriteAsync("Hello World!");
 
                     // Nonrenewable
-                    await _nonRenewable.WaitAsync(1, cancellationToken: context.RequestAborted);
+                    await _nonRenewable.WaitAsync(1, cancellationToken: context.RequestAborted); // check the count is non-zero
                     try
                     {
                         await context.Response.WriteAsync("Hello World!");
@@ -525,9 +525,13 @@ namespace Throttling
                     }
 
                     // ResourceLimiter
-                    using (await _resourceLimiter.AcquireAsync(1, cancellationToken: context.RequestAborted))
+                    using (var resourceWrapper = await _resourceLimiter.AcquireAsync(1, cancellationToken: context.RequestAborted))
                     {
-                        await context.Response.WriteAsync("Hello World!");
+                        if (resourceWrapper.Count == 1)
+                        {
+                            await context.Response.WriteAsync("Hello World!");
+                        }
+                        // 429
                     }
 
                     // DI based limiter
@@ -537,6 +541,8 @@ namespace Throttling
                     foreach (var limiter in limiters)
                     {
                         // handle where only some of the limiters were obtained
+                        // Order is import to prevent deadlock
+                        // WaitAll might deadlock
                         await limiter.WaitAsync(1);
                     }
 
@@ -551,7 +557,6 @@ namespace Throttling
                             limiter.Release(1);
                         }
                     }
-
                 });
             });
         }

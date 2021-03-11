@@ -12,36 +12,24 @@ using Microsoft.Extensions.Hosting;
 
 namespace Throttling
 {
-    public interface IResource
-    {
-        // For metrics, an inaccurate view of resources
-        long EstimatedCount { get; }
-
-        // Fast synchronous attempt to peek at resources, it won't actually acquire the resource
-        bool TryPeek(long requestedCount);
-
-        // Wait until the requested resources are available
-        ValueTask<long> WaitAsync(long requestedCount, bool minimumCount = false, CancellationToken cancellationToken = default);
-
-        // Released requested resources
-        void Release(long consumedCount);
-    }
-
     public interface IResourceLimiter
     {
         // For metrics, an inaccurate view of resources
         long EstimatedCount { get; }
 
         // Fast synchronous attempt to acquire resources, it won't actually acquire the resource
-        IResourceWrapper TryAcquire(long requestedCount, bool minimumCount = false);
+        IResource TryAcquire(long requestedCount, bool minimumCount = false);
 
         // Wait until the requested resources are available
-        ValueTask<IResourceWrapper> AcquireAsync(long requestedCount, bool minimumCount = false, CancellationToken cancellationToken = default);
+        ValueTask<IResource> AcquireAsync(long requestedCount, bool minimumCount = false, CancellationToken cancellationToken = default);
     }
 
-    public interface IResourceWrapper : IDisposable
+    public interface IResource : IDisposable
     {
         long Count { get; }
+
+        // Return a part of the obtained resources early.
+        void Release(long releaseCount);
     }
 
     public interface IResourceStore
@@ -232,14 +220,14 @@ namespace Throttling
                 }
             }, this, TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(1));
         }
-        public ValueTask<IResourceWrapper> AcquireAsync(long requestedCount, bool minimumCount = false, CancellationToken cancellationToken = default)
+        public ValueTask<IResource> AcquireAsync(long requestedCount, bool minimumCount = false, CancellationToken cancellationToken = default)
         {
             lock (_lock) // Check lock check
             {
                 if (EstimatedCount > requestedCount)
                 {
                     Interlocked.Add(ref _resourceCount, -requestedCount);
-                    return ValueTask.FromResult((IResourceWrapper)(new Resource2(requestedCount, this)));
+                    return ValueTask.FromResult((IResource)(new Resource(requestedCount, this)));
                 }
             }
 
@@ -252,9 +240,9 @@ namespace Throttling
                     {
                         var obtainedResource = Math.Min(requestedCount, available);
                         Interlocked.Add(ref _resourceCount, -obtainedResource);
-                        return ValueTask.FromResult((IResourceWrapper)(new Resource2(obtainedResource, this)));
+                        return ValueTask.FromResult((IResource)(new Resource(obtainedResource, this)));
                     }
-                    return ValueTask.FromResult((IResourceWrapper)(new Resource2(0, this)));
+                    return ValueTask.FromResult((IResource)(new Resource(0, this)));
                 }
             }
 
@@ -272,35 +260,35 @@ namespace Throttling
                     if (EstimatedCount > requestedCount)
                     {
                         Interlocked.Add(ref _resourceCount, -requestedCount);
-                        return ValueTask.FromResult((IResourceWrapper)(new Resource2(requestedCount, this)));
+                        return ValueTask.FromResult((IResource)(new Resource(requestedCount, this)));
                     }
                 }
             }
         }
 
-        public IResourceWrapper TryAcquire(long requestedCount, bool minimumCount = false)
+        public IResource TryAcquire(long requestedCount, bool minimumCount = false)
         {
             if (EstimatedCount > requestedCount)
             {
                 Interlocked.Add(ref _resourceCount, -requestedCount);
-                return new Resource2(requestedCount, this);
+                return new Resource(requestedCount, this);
             }
 
             if (minimumCount)
             {
                 // Check resource count is positive
-                return new Resource2(Interlocked.Exchange(ref _resourceCount, 0), this);
+                return new Resource(Interlocked.Exchange(ref _resourceCount, 0), this);
             }
 
-            return new Resource2(0, this);
+            return new Resource(0, this);
         }
 
-        internal class Resource2 : IResourceWrapper
+        internal class Resource : IResource
         {
             private long _count;
             private ResourceLimiter _limiter;
 
-            public Resource2(long count, ResourceLimiter limiter)
+            public Resource(long count, ResourceLimiter limiter)
             {
                 _count = count;
                 _limiter = limiter;
@@ -313,168 +301,18 @@ namespace Throttling
                 // If ResourceLimiter is non-renewable
                 // ResourceLimiter.Release(_count);
             }
-        }
-    }
 
-    internal class NonRenewableResource : IResource
-    {
-        private long _resourceCount;
-        private object _lock = new object();
-        private ManualResetEventSlim _mre;
-
-        public long EstimatedCount => Interlocked.Read(ref _resourceCount);
-
-        public NonRenewableResource(long initialResourceCount)
-        {
-            _resourceCount = initialResourceCount;
-            _mre = new ManualResetEventSlim();
-        }
-
-        public void Release(long consumedCount)
-        {
-            // Check for negative requestCount
-            Interlocked.Add(ref _resourceCount, consumedCount);
-            _mre.Set();
-        }
-
-        public bool TryPeek(long requestedCount) => EstimatedCount > requestedCount;
-
-        public ValueTask<long> WaitAsync(long requestedCount, bool minimumCount = false, CancellationToken cancellationToken = default)
-        {
-            // handle requestedCount > max
-            // Check for negative requestCount
-            lock (_lock) // Check lock check
+            public void Release(long releaseCount)
             {
-                if (EstimatedCount > requestedCount)
-                {
-                    Interlocked.Add(ref _resourceCount, -requestedCount);
-                    return ValueTask.FromResult(requestedCount);
-                }
-            }
-
-            if (minimumCount)
-            {
-                lock (_lock)
-                {
-                    var available = EstimatedCount;
-                    if (available > 0)
-                    {
-                        var obtainedResource = Math.Min(requestedCount, available);
-                        Interlocked.Add(ref _resourceCount, -obtainedResource);
-                        return ValueTask.FromResult(obtainedResource);
-                    }
-                    return ValueTask.FromResult(0L);
-                }
-            }
-
-            while (true)
-            {
-                _mre.Wait(cancellationToken); // Handle cancellation
-
-                lock (_lock)
-                {
-                    if (_mre.IsSet)
-                    {
-                        _mre.Reset();
-                    }
-
-                    if (EstimatedCount > requestedCount)
-                    {
-                        Interlocked.Add(ref _resourceCount, -requestedCount);
-                        return ValueTask.FromResult(requestedCount);
-                    }
-                }
+                // If ResourceLimiter is non-renewable
+                // if (releaseCount <= _count)
+                // {
+                //     _count -= releaseCount
+                //     ResourceLimiter.Release(releaseCount);
+                // }
             }
         }
     }
-
-    internal class RenewableResource : IResource
-    {
-        private long _resourceCount;
-        private object _lock = new object();
-        private ManualResetEventSlim _mre = new ManualResetEventSlim(); // Dispose?
-        private Timer _renewTimer;
-
-        public long EstimatedCount => Interlocked.Read(ref _resourceCount);
-
-        public RenewableResource(long initialResourceCount, long newResourcePerSecond)
-        {
-            _resourceCount = initialResourceCount;
-
-            // Start timer, yikes allocations from capturing
-            _renewTimer = new Timer(o =>
-            {
-                var resource = o as RenewableResource;
-
-                if (resource == null)
-                {
-                    return;
-                }
-
-                lock (resource._lock)
-                {
-                    if (resource._resourceCount < initialResourceCount)
-                    {
-                        var resourceToAdd = Math.Min(newResourcePerSecond, initialResourceCount - _resourceCount);
-                        Interlocked.Add(ref _resourceCount, resourceToAdd);
-                        _mre.Set();
-                    }
-                }
-            }, this, TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(1));
-        }
-
-        public void Release(long consumedCount) => new NotSupportedException();
-
-        public bool TryPeek(long requestedCount) => EstimatedCount > requestedCount;
-
-        public ValueTask<long> WaitAsync(long requestedCount, bool minimumCount = false, CancellationToken cancellationToken = default)
-        {
-            // handle requestedCount > max
-            lock (_lock) // Check lock check
-            {
-                if (EstimatedCount > requestedCount)
-                {
-                    Interlocked.Add(ref _resourceCount, -requestedCount);
-                    return ValueTask.FromResult(requestedCount);
-                }
-            }
-
-            if (minimumCount)
-            {
-                lock (_lock)
-                {
-                    var available = EstimatedCount;
-                    if (available > 0)
-                    {
-                        var obtainedResource = Math.Min(requestedCount, available);
-                        Interlocked.Add(ref _resourceCount, -obtainedResource);
-                        return ValueTask.FromResult(obtainedResource);
-                    }
-                    return ValueTask.FromResult(0L);
-                }
-            }
-
-            while (true)
-            {
-                _mre.Wait(cancellationToken); // Handle cancellation
-
-                lock (_lock)
-                {
-                    if (_mre.IsSet)
-                    {
-                        _mre.Reset();
-                    }
-
-                    if (EstimatedCount > requestedCount)
-                    {
-                        Interlocked.Add(ref _resourceCount, -requestedCount);
-                        return ValueTask.FromResult(requestedCount);
-                    }
-                }
-            }
-        }
-    }
-
     public class Startup
     {
         private IResource _renewable = new RenewableResource(5, 2);

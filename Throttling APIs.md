@@ -65,13 +65,13 @@ public interface IResourceLimiter
     long EstimatedCount { get; }
 
     // Fast synchronous attempt to acquire resources, it won't actually acquire the resource
-    IResourceWrapper TryAcquire(long requestedCount, bool minimumCount = false);
+    IResource TryAcquire(long requestedCount, bool minimumCount = false);
 
     // Wait until the requested resources are available
-    ValueTask<IResourceWrapper> AcquireAsync(long requestedCount, bool minimumCount = false, CancellationToken cancellationToken = default);
+    ValueTask<IResource> AcquireAsync(long requestedCount, bool minimumCount = false, CancellationToken cancellationToken = default);
 }
 
-public interface IResourceWrapper : IDisposable
+public interface IResource : IDisposable
 {
     // The amount of resources that are obtained
     long Count { get; }
@@ -102,6 +102,7 @@ endpoints.MapGet("/", async context =>
 ### Open discussions
 
 - How much complexity should this component have? For example, if we want to limit resources based on IP buckets, should there be a resource limiter for each bucket or one limiter for all buckets that then takes in some context to resolve which bucket a request belongs to?
+- Will `IResource` be too high of an overhead as a return value of the IResourceLimiter?
 
 ## Resource counter storage component
 

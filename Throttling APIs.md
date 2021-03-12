@@ -551,3 +551,41 @@ TBD
 ### Open discussions
 
 What level will these APIs live at? Are concepts like Logging, Diagnostics, Activities too high level to be used (likely yes)?
+
+## Scenarios
+
+Rule (/writer, /reader, /)
+Policy (1 writer at a time, 5 new readers/sec, 5 new total consumers/sec)
+
+### Time based, No wait
+
+```c#
+new ByIPLimiter()
+
+public interface IResourceLimiter
+{
+    // For metrics, an inaccurate view of resources
+    long EstimatedCount { get; }
+
+    // Fast synchronous attempt to acquire resources, it won't actually acquire the resource
+    bool TryAcquire(string id, long requestedCount);
+}
+```
+
+### Time based, With wait
+
+```c#
+public interface IResourceLimiter
+{
+    // For metrics, an inaccurate view of resources
+    long EstimatedCount { get; }
+
+    // Wait until the requested resources are available
+    ValueTask<bool> AcquireAsync(string id, long requestedCount, CancellationToken cancellationToken = default);
+}
+```
+
+### Count based, No wait
+
+
+### Count based, With wait

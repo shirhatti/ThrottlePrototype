@@ -10,6 +10,8 @@ using Microsoft.Extensions.Caching.Memory;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 
+#nullable enable
+
 namespace Throttling
 {
     public interface IResourceLimiter
@@ -44,149 +46,161 @@ namespace Throttling
     public interface IResourcePolicy
     {
         // Empty string if the policy is not applicable
-        string GenerateKey(ResourceContext context);
-
-        IResource CreateLimiter(string key);
-    }
-
-    public class ResourceContext
-    {
-        public ResourceContext(HttpContext context)
-        {
-            HttpContext = context;
-        }
-
-        public HttpContext HttpContext { get; }
+        IResourceLimiter? ResolveResourceLimiter(HttpContext context); // Use another format for context
     }
 
     // public interface IResourceManager
 
     public interface IResourceManager
     {
-        IEnumerable<IResource> GetLimiters(ResourceContext context);
+        IEnumerable<IResourceLimiter> GetLimiters(HttpContext context); // Use another format for context
     }
 
     public class ResourceManager : IResourceManager
     {
         private IEnumerable<IResourcePolicy> _policies;
-        private MemoryCache _limiterCache = new MemoryCache(new MemoryCacheOptions());
 
         public ResourceManager(IEnumerable<IResourcePolicy> policies)
         {
             _policies = policies;
         }
 
-        public IEnumerable<IResource> GetLimiters(ResourceContext context)
+        public IEnumerable<IResourceLimiter> GetLimiters(HttpContext context)
         {
             foreach (var policy in _policies)
             {
-                var key = policy.GenerateKey(context);
-                if (string.IsNullOrEmpty(key))
+                var limiter = policy.ResolveResourceLimiter(context);
+
+                if (limiter != null)
                 {
-                    continue;
+                    yield return limiter;
                 }
-
-                yield return _limiterCache.GetOrCreate(key, e => policy.CreateLimiter(key));
             }
         }
     }
 
-    public class GETResourcePolicy : IResourcePolicy
+    public class ReadRateLimitPolicy : IResourcePolicy
     {
-        private IResourceStore _store;
+        private RenewableResourceLimiter _resourceLimiter = new RenewableResourceLimiter(5, 5);
 
-        public GETResourcePolicy(IResourceStore store)
+        public IResourceLimiter? ResolveResourceLimiter(HttpContext context)
         {
-            _store = store;
-        }
-
-        public string GenerateKey(ResourceContext context)
-        {
-            if (context.HttpContext.Request.Method == HttpMethods.Get)
+            if (context.Request.Path != "/read")
             {
-                return nameof(GETResourcePolicy) + context.HttpContext.Connection.RemoteIpAddress.ToString();
+                return null;
             }
 
-            return string.Empty;
-        }
-
-        public IResource CreateLimiter(string key)
-        {
-            return new ResourceWithStore(_store, key, 100);
+            return _resourceLimiter;
         }
     }
 
-    // Non-renewable
-    internal class ResourceWithStore : IResource
+    public class DefaultRateLimitPolicy : IResourcePolicy
     {
-        private string _key;
-        private IResourceStore _store;
-        private long _resourceCap;
-        private object _lock = new object();
-        private ManualResetEventSlim _mre;
+        private RenewableResourceLimiter _resourceLimiter = new RenewableResourceLimiter(10, 5);
 
-        public ResourceWithStore(IResourceStore store, string key, long resouceCap)
+        public IResourceLimiter? ResolveResourceLimiter(HttpContext context) => _resourceLimiter;
+    }
+
+    public class WriteRateLimitPolicy : IResourcePolicy
+    {
+        private readonly int _ipBuckets;
+        private NonrenewableResourceLimiter[] _writeLimiters;
+
+        public WriteRateLimitPolicy(int ipBuckets)
         {
-            _key = key;
-            _store = store;
-            _resourceCap = resouceCap;
+            _ipBuckets = ipBuckets;
+            _writeLimiters = new NonrenewableResourceLimiter[_ipBuckets];
         }
 
-        public long EstimatedCount => _resourceCap - _store.GetResourceCountAsync(_key).GetAwaiter().GetResult();
-
-        public void Release(long consumedCount)
+        public IResourceLimiter? ResolveResourceLimiter(HttpContext context)
         {
-            _store.UpdateResourceCountAsync(_key, -consumedCount).GetAwaiter().GetResult();
-        }
-
-        public bool TryPeek(long requestedCount) => EstimatedCount > requestedCount;
-
-        public async ValueTask<long> WaitAsync(long requestedCount, bool minimumCount = false, CancellationToken cancellationToken = default)
-        {
-            var currentCount = EstimatedCount;
-            var updatedCount = await _store.UpdateResourceCountAsync(_key, requestedCount);
-            if (updatedCount > _resourceCap)
+            if (context.Request.Path != "/write")
             {
-                updatedCount = await _store.UpdateResourceCountAsync(_key, _resourceCap - updatedCount);
+                return null;
             }
 
-            return updatedCount - currentCount;
+            var ipBucket = context.Connection.RemoteIpAddress?.GetAddressBytes()[0] / (byte.MaxValue / _ipBuckets) ?? 0;
+
+            if (_writeLimiters[ipBucket] == null)
+            {
+                _writeLimiters[ipBucket] = new NonrenewableResourceLimiter(1);
+            }
+
+            return _writeLimiters[ipBucket];
         }
     }
 
-    internal class MockRedisConnection
-    {
+    // // Non-renewable
+    // internal class ResourceWithStore : IResourceLimiter
+    // {
+    //     private string _key;
+    //     private IResourceStore _store;
+    //     private long _resourceCap;
+    //     private object _lock = new object();
+    //     private ManualResetEventSlim _mre;
 
-    }
+    //     public ResourceWithStore(IResourceStore store, string key, long resouceCap)
+    //     {
+    //         _key = key;
+    //         _store = store;
+    //         _resourceCap = resouceCap;
+    //     }
 
-    internal class RedisResourceStore : IResourceStore
-    {
-        private MockRedisConnection _connection;
-        private MemoryCache _localCache;
+    //     public long EstimatedCount => _resourceCap - _store.GetResourceCountAsync(_key).GetAwaiter().GetResult();
 
-        public RedisResourceStore(MockRedisConnection connection)
-        {
-            _connection = connection;
+    //     public void Release(long consumedCount)
+    //     {
+    //         _store.UpdateResourceCountAsync(_key, -consumedCount).GetAwaiter().GetResult();
+    //     }
 
-            // start a background task that periodically syncs the local cache with redis
-        }
+    //     public bool TryAcquire(long requestedCount) => EstimatedCount > requestedCount;
 
-        public ValueTask<long> GetResourceCountAsync(string id)
-        {
-            return ValueTask.FromResult(_localCache.GetOrCreate(id, e => 0L));
-        }
+    //     public async ValueTask<long> AquireAsync(long requestedCount, bool minimumCount = false, CancellationToken cancellationToken = default)
+    //     {
+    //         var currentCount = EstimatedCount;
+    //         var updatedCount = await _store.UpdateResourceCountAsync(_key, requestedCount);
+    //         if (updatedCount > _resourceCap)
+    //         {
+    //             updatedCount = await _store.UpdateResourceCountAsync(_key, _resourceCap - updatedCount);
+    //         }
 
-        public async ValueTask<long> UpdateResourceCountAsync(string id, long resourceRequested, bool allowBestEffort)
-        {
-            var result = await GetResourceCountAsync(id) + resourceRequested;
-            // Need to lock on key
-            _localCache.Set(id, result);
+    //         return updatedCount - currentCount;
+    //     }
+    // }
 
-            return result;
-        }
-    }
+    // internal class MockRedisConnection
+    // {
 
-    internal class ResourceLimiter : IResourceLimiter
+    // }
+
+    // internal class RedisResourceStore : IResourceStore
+    // {
+    //     private MockRedisConnection _connection;
+    //     private MemoryCache _localCache;
+
+    //     public RedisResourceStore(MockRedisConnection connection)
+    //     {
+    //         _connection = connection;
+
+    //         // start a background task that periodically syncs the local cache with redis
+    //     }
+
+    //     public ValueTask<long> GetResourceCountAsync(string id)
+    //     {
+    //         return ValueTask.FromResult(_localCache.GetOrCreate(id, e => 0L));
+    //     }
+
+    //     public async ValueTask<long> UpdateResourceCountAsync(string id, long resourceRequested, bool allowBestEffort)
+    //     {
+    //         var result = await GetResourceCountAsync(id) + resourceRequested;
+    //         // Need to lock on key
+    //         _localCache.Set(id, result);
+
+    //         return result;
+    //     }
+    // }
+
+    internal class RenewableResourceLimiter : IResourceLimiter
     {
         private long _resourceCount;
         private object _lock = new object();
@@ -195,14 +209,14 @@ namespace Throttling
 
         public long EstimatedCount => Interlocked.Read(ref _resourceCount);
 
-        public ResourceLimiter(long initialResourceCount, long newResourcePerSecond)
+        public RenewableResourceLimiter(long initialResourceCount, long newResourcePerSecond)
         {
             _resourceCount = initialResourceCount;
 
             // Start timer, yikes allocations from capturing
             _renewTimer = new Timer(o =>
             {
-                var resource = o as ResourceLimiter;
+                var resource = o as RenewableResourceLimiter;
 
                 if (resource == null)
                 {
@@ -286,9 +300,9 @@ namespace Throttling
         internal class Resource : IResource
         {
             private long _count;
-            private ResourceLimiter _limiter;
+            private RenewableResourceLimiter _limiter;
 
-            public Resource(long count, ResourceLimiter limiter)
+            public Resource(long count, RenewableResourceLimiter limiter)
             {
                 _count = count;
                 _limiter = limiter;
@@ -313,19 +327,125 @@ namespace Throttling
             }
         }
     }
+
+    internal class NonrenewableResourceLimiter : IResourceLimiter
+    {
+        private long _resourceCount;
+        private readonly long _maxResourceCount;
+        private object _lock = new object();
+        private ManualResetEventSlim _mre = new ManualResetEventSlim(); // Dispose?
+
+        public long EstimatedCount => Interlocked.Read(ref _resourceCount);
+
+        public NonrenewableResourceLimiter(long initialResourceCount)
+        {
+            _resourceCount = initialResourceCount;
+            _maxResourceCount = initialResourceCount;
+            _mre = new ManualResetEventSlim();
+        }
+        public ValueTask<IResource> AcquireAsync(long requestedCount, bool minimumCount = false, CancellationToken cancellationToken = default)
+        {
+            if (requestedCount <= 0 || requestedCount > _maxResourceCount)
+            {
+                return ValueTask.FromResult<IResource>(new Resource(0, this));
+            }
+
+            if (EstimatedCount > requestedCount)
+            {
+                lock (_lock) // Check lock check
+                {
+                    if (EstimatedCount > requestedCount)
+                    {
+                        Interlocked.Add(ref _resourceCount, -requestedCount);
+                        return ValueTask.FromResult<IResource>(new Resource(requestedCount, this));
+                    }
+                }
+            }
+
+            while (true)
+            {
+                _mre.Wait(cancellationToken); // Handle cancellation
+
+                lock (_lock)
+                {
+                    if (_mre.IsSet)
+                    {
+                        _mre.Reset();
+                    }
+
+                    if (EstimatedCount > requestedCount)
+                    {
+                        Interlocked.Add(ref _resourceCount, -requestedCount);
+                        return ValueTask.FromResult((IResource)(new Resource(requestedCount, this)));
+                    }
+                }
+            }
+        }
+
+        public IResource TryAcquire(long requestedCount, bool minimumCount = false)
+        {
+            if (requestedCount <= 0 || requestedCount > _maxResourceCount || EstimatedCount < requestedCount)
+            {
+                return new Resource(0, this);
+            }
+
+            lock (_lock)
+            {
+                if (EstimatedCount > requestedCount)
+                {
+                    Interlocked.Add(ref _resourceCount, -requestedCount);
+                    return new Resource(requestedCount, this);
+                }
+            }
+
+            return new Resource(0, this);
+        }
+
+        private void Release(long count)
+        {
+            // Check for negative requestCount
+            Interlocked.Add(ref _resourceCount, count);
+            _mre.Set();
+        }
+
+        internal class Resource : IResource
+        {
+            private long _count;
+            private NonrenewableResourceLimiter _limiter;
+
+            public Resource(long count, NonrenewableResourceLimiter limiter)
+            {
+                _count = count;
+                _limiter = limiter;
+            }
+
+            public long Count => _count;
+
+            public void Dispose()
+            {
+                _limiter.Release(_count);
+            }
+
+            public void Release(long releaseCount)
+            {
+                if (releaseCount <= _count)
+                {
+                    _count -= releaseCount;
+                    _limiter.Release(releaseCount);
+                }
+            }
+        }
+    }
     public class Startup
     {
-        private IResource _renewable = new RenewableResource(5, 2);
-        private IResource _nonRenewable = new NonRenewableResource(5);
-        private IResourceLimiter _resourceLimiter = new ResourceLimiter(5, 2);
-
         // This method gets called by the runtime. Use this method to add services to the container.
         // For more information on how to configure your application, visit https://go.microsoft.com/fwlink/?LinkID=398940
         public void ConfigureServices(IServiceCollection services)
         {
-            services.AddSingleton<IResourceStore, RedisResourceStore>();
-            services.AddSingleton<IResourcePolicy, GETResourcePolicy>();
-            services.AddSingleton<IResourcePolicy, POSTResourcePolicy>();
+            // services.AddSingleton<IResourceStore, RedisResourceStore>();
+            services.AddSingleton<IResourcePolicy, DefaultRateLimitPolicy>();
+            services.AddSingleton<IResourcePolicy, ReadRateLimitPolicy>();
+            services.AddSingleton<IResourcePolicy, WriteRateLimitPolicy>();
             services.AddSingleton<IResourceManager, ResourceManager>();
         }
 
@@ -343,45 +463,27 @@ namespace Throttling
             {
                 endpoints.MapGet("/", async context =>
                 {
-                    // Renewable
-                    if (await _renewable.WaitAsync(1) == 0)
-                    {
-                        context.Response.StatusCode = StatusCodes.Status429TooManyRequests;
-                        return;
-                    }
-                    await context.Response.WriteAsync("Hello World!");
-
-                    // Nonrenewable
-                    await _nonRenewable.WaitAsync(1, cancellationToken: context.RequestAborted); // check the count is non-zero
-                    try
-                    {
-                        await context.Response.WriteAsync("Hello World!");
-                    }
-                    finally
-                    {
-                        _nonRenewable.Release(1);
-                    }
-
-                    // ResourceLimiter
-                    using (var resourceWrapper = await _resourceLimiter.AcquireAsync(1, cancellationToken: context.RequestAborted))
-                    {
-                        if (resourceWrapper.Count == 1)
-                        {
-                            await context.Response.WriteAsync("Hello World!");
-                        }
-                        // 429
-                    }
-
-                    // DI based limiter
                     var manager = context.RequestServices.GetRequiredService<IResourceManager>();
-                    var limiters = manager.GetLimiters(new ResourceContext(context));
+                    var limiters = manager.GetLimiters(context);
+
+                    var obtainedResources = new List<IResource>();
 
                     foreach (var limiter in limiters)
                     {
-                        // handle where only some of the limiters were obtained
-                        // Order is import to prevent deadlock
-                        // WaitAll might deadlock
-                        await limiter.WaitAsync(1);
+                        var resource = limiter.TryAcquire(1);
+
+                        if (resource.Count == 0)
+                        {
+                            // fail
+                            context.Response.StatusCode = StatusCodes.Status429TooManyRequests;
+                            foreach (var obtainedResource in obtainedResources)
+                            {
+                                obtainedResource.Dispose();
+                            }
+                            return;
+                        }
+
+                        obtainedResources.Add(resource);
                     }
 
                     try
@@ -390,9 +492,9 @@ namespace Throttling
                     }
                     finally
                     {
-                        foreach (var limiter in limiters)
+                        foreach (var obtainedResource in obtainedResources)
                         {
-                            limiter.Release(1);
+                            obtainedResource.Dispose();
                         }
                     }
                 });

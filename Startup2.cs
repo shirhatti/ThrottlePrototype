@@ -10,46 +10,41 @@ using Microsoft.Extensions.Hosting;
 
 #nullable enable
 
+// Ignore this file
+// This document was included to illustrate which APIs are shared among different types of resources.
 namespace Throttling2
 {
-    public interface IWaitingRenewable
+    public interface IResourceLimiter
     {
-        // For metrics, an inaccurate view of resources
         long EstimatedCount { get; }
 
-        // Wait until the requested resources are available
-        ValueTask<bool> AcquireAsync(long requestedCount, CancellationToken cancellationToken = default);
-    }
-
-    public interface INoWaitRenewable
-    {
-        // For metrics, an inaccurate view of resources
-        long EstimatedCount { get; }
-
-        // Fast synchronous attempt to acquire resources, it won't actually acquire the resource
         bool TryAcquire(long requestedCount);
     }
 
-    public interface IWaitingNonrenewable
+    public interface IReleasingRateLimiter : IResourceLimiter
     {
-        // For metrics, an inaccurate view of resources
-        long EstimatedCount { get; }
-
-        // Wait until the requested resources are available
-        ValueTask<bool> AcquireAsync(long requestedCount, CancellationToken cancellationToken = default);
-
         void Release(long count);
     }
 
-    public interface INoWaitNonrenewable
+    public interface IWaitingRateLimiter : IResourceLimiter
     {
-        // For metrics, an inaccurate view of resources
-        long EstimatedCount { get; }
+        ValueTask<bool> AcquireAsync(long requestedCount, CancellationToken cancellationToken = default);
+    }
 
-        // Fast synchronous attempt to acquire resources, it won't actually acquire the resource
-        bool TryAcquire(long requestedCount);
+    public interface IWaitingRenewable : IResourceLimiter, IWaitingRateLimiter
+    {
+    }
 
-        void Release(long count);
+    public interface IWaitingNonrenewable : IResourceLimiter, IReleasingRateLimiter, IWaitingRateLimiter
+    {
+    }
+
+    public interface INoWaitNonrenewable : IResourceLimiter, IReleasingRateLimiter
+    {
+    }
+
+    public interface INoWaitRenewable : IResourceLimiter
+    {
     }
 
     public class WaitingRenewable : IWaitingRenewable
@@ -365,7 +360,6 @@ namespace Throttling2
                         return;
                     }
 
-
                     if (context.Request.Path == "/write")
                     {
                         var ipBucket = context.Connection.RemoteIpAddress?.GetAddressBytes()[0] / (byte.MaxValue / ipBuckets) ?? 0;
@@ -381,7 +375,6 @@ namespace Throttling2
                                 writeLimiters[ipBucket].Release(1);
                             }
                         }
-                        await readLimiter.AcquireAsync(1);
                     }
 
                     await context.Response.WriteAsync("Other Op");

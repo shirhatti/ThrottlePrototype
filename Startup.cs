@@ -163,9 +163,21 @@ namespace Throttling
         IRateLimiter? GetRateLimiter(HttpContext context); // Use another format for context
     }
 
-    public class ReadRateLimitPolicy : IRateLimitPolicy
+    public class ReadRateLimitByIPPolicy : IRateLimitPolicy
     {
-        private SelfCountingRateLimiter _resourceLimiter = new SelfCountingRateLimiter(5, 5);
+        private int _ipBuckets = 16;
+        private readonly SelfCountingRateLimiter[] _readLimiters;
+
+        public ReadRateLimitByIPPolicy(int numOfBuckets)
+        {
+            _ipBuckets = numOfBuckets;
+            _readLimiters = new SelfCountingRateLimiter[_ipBuckets];
+
+            for (var i = 0; i < _ipBuckets; i++)
+            {
+                _readLimiters[i] = new SelfCountingRateLimiter(5, 5);
+            }
+        }
 
         public IRateLimiter? GetRateLimiter(HttpContext context)
         {
@@ -174,7 +186,9 @@ namespace Throttling
                 return null;
             }
 
-            return _resourceLimiter;
+            var ipBucket = context.Connection.RemoteIpAddress?.GetAddressBytes()[0] / (byte.MaxValue / ipBuckets) ?? 0;
+
+            return _readLimiters[ipBucket];
         }
     }
 
@@ -220,7 +234,7 @@ namespace Throttling
         public void ConfigureServices(IServiceCollection services)
         {
             services.AddSingleton<IRateLimitPolicy, DefaultRateLimitPolicy>();
-            services.AddSingleton<IRateLimitPolicy, ReadRateLimitPolicy>();
+            services.AddSingleton<IRateLimitPolicy, ReadRateLimitByIPPolicy>();
             services.AddSingleton<IRateLimitPolicyManager, RateLimitPolicyManager>();
         }
 

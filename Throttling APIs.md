@@ -30,6 +30,8 @@ In simpler cases, this layer can directly use the Core layer, for example where 
 
 Users will interact with this component in order to obtain decisions for rate limiting, i.e. self replenishing resources. Non self-replenishing resources are deemed out of scope since they are better represented by the use of Semaphores (though waiting on more than one resource may be necessary in addition to `Semaphore` or `SemaphoreSlim`). This component encompasses the TryAcquire/AcquireAsync mechanics (i.e. check vs wait behaviours) and accounting method (fixed window, sliding window). This API should allow for a simple implementation that keeps an internal count of the underlying resource but also allow the use of an external resource count storage.
 
+To keep the complexity low in this component, for bucketized policies (for example, rate limit by IP), each bucket will be represented by one limiter. The complexity of how bucketing is computed for a request will live in the policy component.
+
 ### Implementation Layer
 
 Core Layer. Both this abstraction and some default implementations will be shipped in the BCL.
@@ -240,7 +242,7 @@ Is there a better way to represent the resourceId than a string?
 
 ### Role
 
-The responsibilities of this component will probably include the settings for filters and limits. For filters, this may include specifying which types of requests the limits are applicable or how requests are to be bucketized. For limits, this will likely entail initial resource counts, soft caps, hard caps, throttling levels, and replentishment parameters (frequency and amount) for self-renewing resources. Potentially, this might need to be separated into different abstractions.
+The responsibilities of this component will probably include the settings for rules and limits. For rules, this may include specifying which types of requests the limits are applicable or how requests are to be bucketized. For limits, this will likely entail initial resource counts, soft caps, hard caps, throttling levels, and replentishment parameters (frequency and amount) for self-renewing resources. Potentially, this might need to be separated into different abstractions.
 
 ### Implementation layer
 

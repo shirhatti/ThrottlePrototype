@@ -31,7 +31,7 @@ namespace Throttling
 
     internal class SelfCountingRateLimiter : IRateLimiter
     {
-        private long _resourceCount;
+        private volatile long _resourceCount;
         private readonly long _maxResourceCount;
         private readonly long _newResourcePerSecond;
         private Timer _renewTimer;
